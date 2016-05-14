@@ -1,0 +1,600 @@
+#!/bin/bash
+# ------------------------------------------------------------------------------
+# @author:  Long Huaqiao
+# @copyright longhq@expert-db.com
+# @doc:     The titan-server start script
+#-------------------------------------------------------------------------------
+
+SCRIPT="`basename \"$0\"`"
+
+log() {
+    echo "${srv_name}($srv_role): $@"
+}
+
+help() {
+    echo "----------------------------------------------------------------------"
+    echo "                   start script usage information"
+    echo "----------------------------------------------------------------------"
+    echo "The Command: '$@' Not support!!!"
+    echo ""
+    echo "$SCRIPT [<dev | hp | -r | -n | -k | reboot | stop>]: "
+    echo "Note: If not devlopment node, the '-r' mandatory option,"
+    echo "      except internal specified reboot argument!!!"
+    echo "Options:"
+    echo "  [dev <start node is devlopment mode>]"
+    echo "  [hp  <start node is half produce mode>]"
+    echo "  [-r < sh_node | dh_node | om_node><specified start task role for server node>]"
+    echo "  [-id < 1 | 2 ><server node id>]"
+    echo "  [-n < integer ><server node number>]"
+    echo "  [-k <Not must need specified args> <keep the old package>]"
+    echo "  [-l <integer = (0 | 2 | 3 | 4 | 5 | 99) > <set debug loglevel print>]"
+    echo "  [-b <arg1=(1 | 2), arg2=(1,2,3), arg3=(1|n)> <arg1:id, arg2:group_id, arg3:number>]"
+    echo "  [ '-b' is means: backup specified server node mnesia data ]"
+    echo "  [-reboot <internel options, support heart reboot erlang node>]"
+    echo "  [stop <if not specified '-g' and '-n', stop all locat server node>]"
+    echo "  'produce' node must be specified '-g' and '-n' "
+    echo ""
+    echo "  Start full devlopment nodes:"
+    echo "    ./titan-server dev"
+    echo "  Start devlopment mode node:"
+    echo "    ./titan-server -r (sh_node|dh_node|om_node) dev"
+    echo "  Start half produce mode node:"
+    echo "    ./titan-server -r (sh_node|dh_node|om_node) hp"
+    echo "  Start produce mode node:"
+    echo "   ./titan-server -r (sh_node|dh_node|om_node) -id (1|2) -n (1|2|n)"
+    echo "  Start specified half produce mode node:"
+    echo "   ./titan-server -r (sh_node|dh_node|om_node) -id (1|2) -n (1|2|n) hp"
+    echo "----------------------------------------------------------------------"
+    exit 0
+}
+
+def_private_env() {
+    local srv_name=${1:?"no server name given"}
+    local group_id=${2:?"no group id given"}
+    local ps_number=${3:?"no server number given"}
+
+    export TITAN_SRV_DIR=$SERVER_ROOT/servicer_${group_id}_${ps_number}
+
+    [ -d $TITAN_SRV_DIR ] || mkdir -p $TITAN_SRV_DIR
+
+    export PRIVATE_DIR=$TITAN_SRV_DIR/private
+
+    ## private subdirs.
+    export LOG_DIR=$PRIVATE_DIR/log
+
+    export DATA_DIR=$DATA_ROOT/servicer_${group_id}_${ps_number}
+    export DATA_BAK=$DATA_BAK_ROOT/servicer_${group_id}_${ps_number}
+
+    export RELEASES_DIR=$PRIVATE_DIR/releases
+
+    export TMP_DIR=$PRIVATE_DIR/tmp
+    [ -d $TMP_DIR ] || mkdir -p $TMP_DIR
+
+    export PIPE_PATH=/tmp
+
+    export SINGLE_PS=${SINGLE_PS:-false}
+    export HALF_PROD=${half_prod_flag:-false}
+
+    local heart_script="$CODE_ROOT/bin/$SCRIPT"
+    if [ -n "$dev_flag" ]; then
+        export DEV="-visual_node devlopment"
+        export SIM_WIN=${SIM_WIN:-true}
+        if [ -z "$half_prod_flag" ]; then
+            export TITAN_LOG_LEVEL=${TITAN_LOG_LEVEL:-99}
+            export HEART_COMMAND="$heart_script -reboot dev"
+        else
+            export HEART_COMMAND="$heart_script -reboot hp"
+        fi
+    else
+        ### If produce mode start node
+        ### Maybe used: export SOFT_START_CMD="/usr/bin/sudo /sbin/reboot -f"
+        export HEART_COMMAND="$heart_script -reboot"
+
+    fi
+    set_inetrc $1 $2 $3
+}
+
+set_inetrc() {
+    local srv_name=$1
+    local group_id=$2
+    local ps_number=$3
+    local intetrc_path=${srv_name}_${group_id}_${ps_number}
+    rm -f /tmp/${intetrc_path}/inetrc_* 2 > /dev/null
+    mkdir -p /tmp/${intetrc_path}
+    inetrc="$(mktemp /tmp/${intetrc_path}/inetrc_XXXX)"
+
+    export ERL_INETRC=$inetrc
+
+    cat > $inetrc <<END
+{lookup, [file, native]}.
+{hosts_file, "$CODE_ROOT/etc/hosts"}.
+END
+}
+
+set_pipe_dir() {
+    export PIPE_DIR="$PIPE_PATH/$1/"
+    [ -d $PIPE_DIR ] || mkdir -p $PIPE_DIR
+}
+
+num_cores() {
+    if echo `uname -a`|grep -Eq "mac"; then
+        sysctl hw.ncpu | awk '{print $2}'
+    else
+        egrep "^processor\W:" /proc/cpuinfo 2> /dev/null | wc -l
+    fi
+}
+
+run_exterm() {
+    local cmd=${1:?"no xterm command given"}
+    if [ "$OS" == "Darwin" ] ; then
+        osascript -e "tell application \"Terminal\" to do script \"bash -c '$cmd'\""
+    else
+        if [ `which -a xterm 2> /dev/null` ]; then
+            local title="-title $2(${NODE_ROLE})"
+            xterm -sl 30000 $title -e bash -c "$cmd" &
+        fi
+    fi
+}
+
+install() {
+    local srv_name=$1
+    local group_id=$2
+    local ps_number=$3
+    local erlang_log_dir=$LOG_DIR/erlang
+
+    [ -d $erlang_log_dir ] || mkdir -p $erlang_log_dir
+
+    local common1="-sname ${srv_name}_ps${group_id}@servicer_${group_id}_${ps_number} \
+-boot start_clean +Ww"
+    local common2="-setcookie ${PS_COOKIE} $DEV -initdb"
+    local pa_sym="$CODE_ROOT/*_sym/sym*/ebin"
+    local pa_erl="-pa $pa_sym -pa $DEV_PATCHES_DIR"
+    local kernel="-kernel net_ticktime 8 net_setuptime 10"
+    local install_flags="start"
+
+    local ERL_CMD="erl -async_shell_start $common1 $pa_erl $common2 $kernel \
+-run sym_install $install_flags -run erlang halt"
+
+    log "Installing, please wait..."
+
+	sleep 3
+
+	run_erl $PIPE_DIR $erlang_log_dir "${ERL_CMD}"&
+
+    local n=0
+	while (true) ; do
+        if [ -f "$RELEASES_DIR/sym_install_complete" ]; then
+            log "sym_install_completed!"
+            return
+        elif [ $n == 15 ]; then
+            error "$srv_name: No $RELEASES_DIR/sym_install_complete found"
+            error "$srv_name: Install failed, exiting!"
+            return
+        else
+            n=`expr ${n} + 1`
+            sleep 1
+        fi
+    done
+}
+
+start() {
+    local srv_name=${1:?"No titan server name given!!!"}
+    local group_id=${2:?"No titan server group id given!!! e.g: -g xx"}
+    local ps_number=${3:?"No titan server number given!!! e.g: -n xx"}
+    local smp_flag=""
+    local ncores=$(num_cores)
+    local BREAKFLAG="+B"
+
+    ## --- For sym_env module used ---
+
+    export SRV_NAME=${SRV_NAME:-$srv_name}
+    export GROUP_ID=${GROUP_ID:-$group_id}
+    export PS_NUMBER=${PS_NUMBER:-$ps_number}
+    export NODE_ROLE=${NODE_ROLE:-$srv_role}
+
+    ## -------------------------------
+
+    echo "Starting: TITAN_NO = $srv_name, GROUP_ID = $group_id, NUMBER = $ps_number"
+
+    ## -----(START) initialize dynamic environment for per servicer -----
+
+    def_private_env $srv_name $group_id $ps_number
+
+    ## ----------------------------END-----------------------------------
+
+    set_pipe_dir ${srv_name}_ps${group_id}
+
+    log "pipe_dir: $PIPE_DIR"
+
+    if [ "$SIM_WIN" == true ] && [ -z "`ps -ef|grep "to_erl $PIPE_DIR"|grep -v grep`" ];
+    then
+        run_exterm \
+        "while ( true ) ; do to_erl $PIPE_DIR  2> /dev/null ; sleep 1;  done" \
+        ${srv_name}_ps${group_id}
+    else
+        log "No xterm window started for $srv_name since SIM_WIN=false or to_erl started."
+    fi
+
+    if [ ! -f "$RELEASES_DIR/sym_install_complete" ] ; then
+          install $srv_name $group_id $ps_number
+    fi
+
+    ## read file data replace to set args
+    ## e.g: set -- 6.1 RC $1=6.1 $2=RC
+    set -- $(< $PRIVATE_DIR/releases/start_erl.data)
+    release=$2
+
+    if [ $ncores -gt 1 ]; then
+        smp_flag="-smp "
+    fi
+
+    case $ncores in
+        12|24) #Server with or without hyperthreading (possibly also simulated)
+            local erl_max_ports=1120000
+            ;;
+           *) #anything else
+            local erl_max_ports=320000
+            ;;
+    esac
+
+    [ -n "$HEART" ] || HEART=-heart
+    [ -n "$DAEMON" ] || DAEMON=-daemon
+    [ -n "$BOOTFLAGS_FILE" ] || BOOTFLAGS_FILE=BOOTFLAGS
+    [ -n "$START_FLAGS" ] || \
+        START_FLAGS="-boot_var CODE_ROOT $CODE_ROOT OTP_ROOT $OTP_ROOT \
+        $BREAKFLAG +Ww -stdlib restricted_shell sym_shell \
+        -mode embedded  \
+        -os_mon memsup_system_only true \
+        -kernel \
+         inet_default_connect_options '[{nodelay, true},{delay_send,true}]' \
+         inet_default_listen_options '[{nodelay, true},{delay_send,true}]' \
+        -setcookie ${PS_COOKIE} \
+        -env ERL_MAX_ETS_TABLES 30000 \
+        -env ERL_MAX_PORTS $erl_max_ports $smp_flag \
+        +zdbbl 32768 \
+        +P $(( 1024**2 )) +K true +A 256 $MBPARAM \
+        $EXTRA_START_FLAGS $DEV"
+
+    log "Starting up, please wait..."
+
+    local BOOTFLAGS=$(<$RELEASES_DIR/$release/$BOOTFLAGS_FILE)
+
+    local ERL_CMD="erl -async_shell_start $BOOTFLAGS $HEART $START_FLAGS"
+
+    log "Use to_erl $PIPE_DIR to connect to shells"
+
+    log "Dumping environment to file: $TMP_DIR/system_env"
+
+    env > $TMP_DIR/system_env
+
+    local erlang_log_dir=$LOG_DIR/erlang
+    [ -d $erlang_log_dir ] || mkdir -p $erlang_log_dir
+
+    run_erl $DAEMON $PIPE_DIR $erlang_log_dir "$ERL_CMD"&
+
+    sleep 1
+
+}
+
+##-------------------devlopment start----------------------------##
+start_all_node() {
+
+    start_om_node
+    start_dh_node
+    start_sh_node
+
+}
+
+start_sh_node() {
+    export srv_role=sh_node
+
+    write_psconfig titan1 1 1
+    write_psconfig titan2 1 2
+
+    start titan1 1 1 &
+    start titan2 1 2 &
+    check_node_status titan1 1 1
+    check_node_status titan2 1 2
+}
+
+start_dh_node() {
+    export srv_role=dh_node
+
+    write_psconfig titan1 2 1
+    write_psconfig titan2 2 2
+
+    start titan1 2 1 &
+    start titan2 2 2 &
+    check_node_status titan1 2 1
+    check_node_status titan2 2 2
+}
+
+start_om_node() {
+    export srv_role=om_node
+
+    write_psconfig titan1 3 1
+    write_psconfig titan2 3 2
+
+    start titan1 3 1 &
+    start titan2 3 2 &
+    check_node_status titan1 3 1
+    check_node_status titan2 3 2
+}
+##-------------------devlopment END-----------------------------##
+
+check_node_status() {
+    local I=0
+    local srv_name=$1
+    local group_id=$2
+    local ps_number=$3
+    local node=${srv_name}_ps${group_id}@servicer_${group_id}_${ps_number}
+    until  $ERL_CALL -sname ${srv_name}_ps${group_id} -c ${PS_COOKIE} \
+            -a "dcm_api ps_info [$node, op_state]" 2> /dev/null |grep -Eq "enabled" && \
+            log "Started successful."|| \
+            [[ $I -eq 18 ]]; do
+        I=$((I + 1))
+        sleep 5
+        echo -e ".\c"
+    done
+    if [ $I -eq 18 ]; then
+        error "Node(${node}) not dual after 1.5 min" 1
+    fi
+}
+
+write_psconfig() {
+    ## $1 = srv_name1 $2 = group_id $3 = ps_number
+    [ ! -e $SERVER_ROOT/ps_config.txt ] && touch $SERVER_ROOT/ps_config.txt
+    if ! grep -Eq "$1, $2, $3" $SERVER_ROOT/ps_config.txt; then
+        echo "$1, $2, $3" >> $SERVER_ROOT/ps_config.txt
+    else
+        echo "Already exist '$1, $2, $3' in ps_config.txt"
+    fi
+}
+
+erl_call() {
+    export SERVER_ROOT=${SERVER_ROOT:-${HOME}/titan_root}
+    export CODE_ROOT=${CODE_ROOT:-${SERVER_ROOT}/titan_server}
+    [ -z "$OTP_ROOT" ] && OTP_ROOT=`ls -d $CODE_ROOT/*_otp/otp-*/priv/pkg`
+    ERL_CALL=$OTP_ROOT/lib/erl_interface-*/bin/erl_call
+}
+
+backup_mnesia() {
+    local srv_name=${1:?"No titan server name given!!!"}
+    local group_id=${2:?"No titan server group id given!!! e.g: -g xx"}
+    local ps_number=${3:?"No titan server number given!!! e.g: -n xx"}
+
+    if $ERL_CALL -sname ${srv_name}_ps${group_id} \
+    -c ${PS_COOKIE} -a "sym_lib backup []"|grep -Eq "ok"; then
+         echo "- Backup mnesia for $srv_name $group_id $ps_number is ok"
+    else
+         echo "- Backup mnesia for $srv_name $group_id $ps_number is error !!!"
+    fi
+
+}
+
+rm_tmpdir() {
+    local srv_name=$1
+    local group_id=$2
+    local ps_number=$3
+
+    rm -rf /tmp/${srv_name}_${group_id}_${ps_number}
+    rm -rf /tmp/${srv_name}_ps${group_id}
+}
+
+stop_all() {
+    ps_conf=$SERVER_ROOT/ps_config.txt
+
+    ## First backup mnesia db
+    if [ -f $ps_conf ]; then
+    (IFS=$'\n';for line in `cat $ps_conf`; do
+         local srv_name=`echo $line | awk -F",[ ]*" '{print $1}'`
+         local group_id=`echo $line | awk -F",[ ]*" '{print $2}'`
+         local ps_number=`echo $line | awk -F",[ ]*" '{print $3}'`
+         backup_mnesia $srv_name $group_id $ps_number
+    done)
+    fi
+
+    ## Second stop node
+    if [ -f $ps_conf ]; then
+    (IFS=$'\n';for line in `cat $ps_conf`; do
+         local srv_name=`echo $line | awk -F",[ ]*" '{print $1}'`
+         local group_id=`echo $line | awk -F",[ ]*" '{print $2}'`
+         local ps_number=`echo $line | awk -F",[ ]*" '{print $3}'`
+         stop $srv_name $group_id $ps_number
+         rm_tmpdir $srv_name $group_id $ps_number
+    done)
+    fi
+}
+
+stop() {
+    local srv_name=$1
+    local group_id=$2
+    local ps_number=$3
+
+    if $ERL_CALL -sname ${srv_name}_ps${group_id} \
+        -c ${PS_COOKIE} -a "init stop []"|grep -Eq "ok"; then
+        echo "-- Stopped processes for $srv_name $group_id $ps_number"
+    else
+        kill_process "beam" ${group_id} $srv_name
+        kill_process "run_erl" ${group_id} $srv_name
+    fi
+    export SIM_WIN=${SIM_WIN:-true}
+    if [ "$SIM_WIN" == true ] && [ "$OS" == "Linux" ] && \
+       [ `which -a xterm 2> /dev/null` ]; then
+         [ -n "$TOOL" ] || TOOL="xterm -sl 30000" # TOOL might not be set
+         echo "Executing: pkill -9 -f $TOOL -title $srv_name"
+         pkill -9 -f "$TOOL -title $srv_name"
+         wait $!
+    fi
+}
+
+kill_process() {
+    local match_app=${1:?"No match application specified"}
+    local group_id=${2:?"No server group id specified"}
+    local srv_name=${3:?"No server name specified"}
+
+    for i in `pgrep $match_app`; do
+        if [ "`ps h $i | grep ${srv_name}_ps${group_id}`" != "" ];then
+            for ii in `pgrep -P $i`; do
+                if [ "`ps h $ii | grep heart`" != "" ]; then
+                    echo "Killing heart process $ii for ${srv_name}_ps${group_id}"
+                    kill -9 $ii
+                    wait $!
+                fi
+            done
+            echo "Killing $match_app process $i for ${srv_name}_ps${group_id}"
+            kill -9 $i
+            wait $!
+        fi
+    done
+}
+
+select_start_mode() {
+     if [ -z "$srv_id" ] && [ -z "$ps_number" ] && [ -n "$dev_flag" ]; then
+
+        . "$SCRIPT_DIR/config-env.sh"
+
+         if  [ "$srv_role" = "dh_node" ]; then
+            start_dh_node
+        elif [ "$srv_role" = "om_node" ]; then
+            start_om_node
+        elif [ "$srv_role" = "sh_node" ]; then
+            start_sh_node
+        elif [ -z "$half_prod_flag" ]; then
+            start_all_node
+        fi
+    elif [ -n "$srv_id" ] && [ -n "$ps_number" ] && [ -z "$dev_flag" ]; then
+
+        . "$SCRIPT_DIR/config-env.sh"
+
+        write_psconfig titan${srv_id} $group_id $ps_number
+        start titan${srv_id} $group_id $ps_number
+        check_node_status titan${srv_id} $group_id $ps_number
+    else
+        echo "start error $@" && help
+    fi
+}
+
+set_loglevel() {
+   if ([ $1 -ge 0 ] && [ $1 -le 5 ]) || ([ $1 -eq 99 ]); then
+        export TITAN_LOG_LEVEL=$1   ### set debug log level
+   else
+       echo "If specified -l X, the X must be equal (0|1|2|3|4|5|99)."
+       exit 1
+   fi
+}
+
+## -------------------------Starting----------------------------- ##
+
+export SCRIPT_DIR=`cd \`dirname $0\` && /bin/pwd`
+export OS=`uname -s`
+export PS_COOKIE=${PS_COOKIE:-"titan_ABCDEF123456"}
+
+## Number of parameters is greater than 0 is true, otherwise exit
+[ $# -gt 0 ] || help $*
+
+while [ $# -gt 0 ]; do
+    case $1 in
+          dev)
+            dev_flag=true           ### Start node used devlopment mode
+            shift
+            ;;
+          hp)
+             dev_flag=true          ### Start node used devlopment mode
+             half_prod_flag=true    ### enabled half produce mode
+             shift
+             ;;
+          -r)
+            if [ $2 = "sh_node" ] || [ $2 = "dh_node" ] || [ $2 = "om_node" ]; then
+                srv_role=$2
+                shift 2
+            else
+                echo "If specified -r X, the X must be equal (sh_node|dh_node|om_node)."
+                exit 1
+            fi
+            ;;
+          -id)
+            if [ $2 = "1" ] || [ $2 = "2" ]; then
+                srv_id=$2
+                shift 2
+            else
+                echo "If specified -id X, the X must be equal (1|2)."
+                exit 1
+            fi
+            ;;
+          -n)
+            if [ $2 -ge 1 ]; then
+                ps_number=$2   ###Start node used ps_number(server number identifier)
+                shift 2
+            else
+                echo "If specified -n X, the X must be more than 1."
+                exit 1
+            fi
+            ;;
+          -k)
+            ds_keep=true   ###keep the old package
+            shift
+            ;;
+          -b)
+            erl_call
+            backup_mnesia titan${2} $3 $4
+            exit 0
+            ;;
+          -l)
+            set_loglevel $2
+            shift 2
+            ;;
+          -reboot)
+            PATH=${OTP_ROOT:?}/bin:$PATH
+            rb_flag=true   ###heart command restart flag(not support manual reboot)
+            shift
+            ;;
+          stop)
+            erl_call
+            stop_all
+            exit 0
+            ;;
+            *)
+            help $*
+            ;;
+     esac
+done
+
+if [ -z "$rb_flag" ]; then
+
+## --------------------------------------------------------------##
+## group_id = 1, used in sh_node
+## group_id = 2, used in dh_node
+## group_id = 3, used in om_node
+## --------------------------------------------------------------##
+    if [ -z "$dev_flag" ] || [ -n "$half_prod_flag" ]; then
+        if [ "$srv_role" = "sh_node" ]; then
+            group_id=1
+        elif [ "$srv_role" = "dh_node" ]; then
+            group_id=2
+        elif [ "$srv_role" = "om_node" ]; then
+            group_id=3
+        else
+            echo "The $@ role name not support" && help
+        fi
+    fi
+
+    if [ -n "$srv_id" ] && [ -n "$ps_number" ]  && [ -n "$half_prod_flag" ]; then
+
+        ## --------------------------------------------------------------##
+        ## Load base config environment
+
+        . "$SCRIPT_DIR/config-env.sh"
+
+        ## --------------------------------------------------------------##
+
+        start titan${srv_id} $group_id $ps_number
+        check_node_status titan${srv_id} $group_id $ps_number
+    else
+        select_start_mode
+    fi
+    # Let the scripts finish and print their output before returning.
+    wait $pid
+else
+    start $SRV_NAME $GROUP_ID $PS_NUMBER
+fi
